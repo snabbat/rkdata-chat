@@ -1,0 +1,21 @@
+# Thème RK Data (charte v1.0) — aucune ressource externe : la police Source Sans
+# est embarquée et servie par Streamlit lui-même.
+[theme]
+base = "light"
+primaryColor = "#1654F2"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F6FD"
+textColor = "#171A27"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+# Adresse fixée : sans elle, Streamlit interroge checkip.amazonaws.com au démarrage
+# pour afficher une « External URL ». Ici, aucun appel sortant.
+serverAddress = "localhost"
+
+[server]
+headless = true
+
+[client]
+toolbarMode = "minimal"

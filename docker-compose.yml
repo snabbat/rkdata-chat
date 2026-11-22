@@ -1,0 +1,213 @@
+# RK Data — Chat avec votre Lakehouse (POC on-premise)
+#
+#   MinIO (S3) ─┬─ Hive Metastore (PostgreSQL) ── Trino (Iceberg) ── app Streamlit ── Ollama
+#               └──────────── fichiers Parquet ─────────┘
+#
+# Tous les secrets et versions viennent du fichier .env (voir .env.example).
+name: rkdata-chat
+
+services:
+  # --- Stockage objet S3 ----------------------------------------------------
+  minio:
+    image: ${MINIO_IMAGE}
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?définir MINIO_ROOT_USER dans .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?définir MINIO_ROOT_PASSWORD dans .env}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    restart: unless-stopped
+
+  # Job : attend MinIO puis crée le bucket `warehouse`.
+  minio-init:
+    image: ${MC_IMAGE}
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MC_CONFIG_DIR: /tmp/mc
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        i=0
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
+          i=$$((i+1))
+          if [ "$$i" -ge 60 ]; then echo "MinIO injoignable"; exit 1; fi
+          sleep 1
+        done
+        mc mb --ignore-existing local/warehouse
+        echo "Bucket warehouse prêt."
+    restart: "no"
+
+  # --- Hive Metastore (catalogue Iceberg) ------------------------------------
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-16}
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: ${HMS_DB_USER:?définir HMS_DB_USER dans .env}
+      POSTGRES_PASSWORD: ${HMS_DB_PASSWORD:?définir HMS_DB_PASSWORD dans .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  hive-metastore:
+    build:
+      context: ./infra/hive
+      args:
+        HIVE_VERSION: ${HIVE_VERSION:-4.0.1}
+    image: rkdata-chat/hive-metastore:${HIVE_VERSION:-4.0.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=${HMS_DB_USER}
+        -Djavax.jdo.option.ConnectionPassword=${HMS_DB_PASSWORD}
+      HIVE_CUSTOM_CONF_DIR: /hive-custom-conf
+      # Lus par S3A (EnvironmentVariableCredentialsProvider, cf. hive-site.xml).
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./infra/hive/conf:/hive-custom-conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+
+  # --- Moteur SQL -------------------------------------------------------------
+  trino:
+    image: trinodb/trino:${TRINO_VERSION:-484}
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./infra/trino/catalog:/etc/trino/catalog:ro
+      - ./infra/trino/access-control.properties:/etc/trino/access-control.properties:ro
+      - ./infra/trino/rules.json:/etc/trino/rules.json:ro
+    ports:
+      - "127.0.0.1:${TRINO_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # Job : charge les données de démonstration avec le CLI Trino (utilisateur admin).
+  # Ne recharge pas si les tables existent déjà, sauf FORCE_SEED=1.
+  seed:
+    image: trinodb/trino:${TRINO_VERSION:-484}
+    depends_on:
+      trino:
+        condition: service_healthy
+    environment:
+      FORCE_SEED: ${FORCE_SEED:-0}
+    volumes:
+      - ./infra/seed:/seed:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -eu
+        run() { trino --server http://trino:8080 --user admin "$$@"; }
+        existing=$$(run --output-format TSV --execute "SELECT count(*) FROM iceberg.banque.credits" 2>/dev/null || echo 0)
+        if [ "$$existing" != "0" ] && [ "$$FORCE_SEED" != "1" ]; then
+          echo "Données déjà chargées ($$existing crédits) : rien à faire. FORCE_SEED=1 pour recharger."
+        else
+          echo "Chargement de seed_trino.sql..."
+          run --file /seed/seed_trino.sql
+        fi
+        run --output-format ALIGNED --execute "
+          SELECT 'agences' AS table_name, count(*) AS lignes FROM iceberg.banque.agences
+          UNION ALL SELECT 'clients', count(*) FROM iceberg.banque.clients
+          UNION ALL SELECT 'comptes', count(*) FROM iceberg.banque.comptes
+          UNION ALL SELECT 'transactions', count(*) FROM iceberg.banque.transactions
+          UNION ALL SELECT 'credits', count(*) FROM iceberg.banque.credits
+          ORDER BY 1"
+        echo "Seed terminé."
+    restart: "no"
+
+  # --- LLM local (profil `ollama` ; désactivable, cf. .env.example) -------------
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.40.17}
+    profiles: ["ollama"]
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Job : télécharge le modèle dans le volume d'Ollama (une seule fois).
+  ollama-pull:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.40.17}
+    profiles: ["ollama"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${LLM_MODEL:-qwen2.5-coder:7b}"]
+    restart: "no"
+
+  # --- Application ------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12-slim}
+    image: rkdata-chat/app:latest
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      ollama-pull:
+        condition: service_completed_successfully
+        required: false # absent quand on utilise l'Ollama du poste
+    environment:
+      DB_BACKEND: trino
+      TRINO_HOST: trino
+      TRINO_PORT: "8080"
+      TRINO_USER: chatbot # utilisateur en lecture seule (infra/trino/rules.json)
+      TRINO_CATALOG: iceberg
+      TRINO_SCHEMA: banque
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5-coder:7b}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
+      LLM_KEEP_ALIVE: ${LLM_KEEP_ALIVE:-60m}
+      MAX_ROWS: ${MAX_ROWS:-200}
+      QUERY_TIMEOUT_S: ${QUERY_TIMEOUT_S:-30}
+      APP_USER: ${APP_USER:-demo}
+    volumes:
+      - ./semantic:/srv/semantic:ro
+      - ./data:/srv/data:ro
+      - ./logs:/srv/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${APP_PORT:-8501}:8501"
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  postgres-data:
+  ollama-data:

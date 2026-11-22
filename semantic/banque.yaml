@@ -1,0 +1,148 @@
+# ---------------------------------------------------------------------------
+# Couche sémantique — domaine « banque de détail » (données fictives)
+#
+# Source UNIQUE des descriptions métier. Ce fichier alimente :
+#   1. les COMMENT posés sur les tables et colonnes Iceberg (scripts/generate_data.py)
+#   2. le prompt système envoyé au LLM (app/agent.py)
+#   3. les questions d'exemple affichées dans l'interface (app/ui.py)
+#
+# Pour adapter le POC à un client : remplacer ce fichier (ou le générer depuis
+# un catalogue de données type OpenMetadata) — aucun code Python à modifier.
+# ---------------------------------------------------------------------------
+
+domaine: Banque de détail
+schema: banque
+
+contexte: >
+  Données d'une banque de détail marocaine fictive. Tous les montants sont
+  exprimés en dirhams (MAD). L'historique des transactions couvre la période
+  du 2025-01-01 au 2026-10-31 ; la date de référence des données (« aujourd'hui »)
+  est le 2026-10-31.
+
+tables:
+  agences:
+    description: Réseau d'agences de la banque (une ligne par agence).
+    colonnes:
+      agence_id: Identifiant unique de l'agence (clé primaire).
+      nom_agence: Nom commercial de l'agence.
+      ville: Ville où se situe l'agence.
+      region: >-
+        Région administrative du Maroc où se situe l'agence
+        (ex. Casablanca-Settat, Rabat-Salé-Kénitra, Marrakech-Safi).
+
+  clients:
+    description: Référentiel des clients de la banque (une ligne par client).
+    colonnes:
+      client_id: Identifiant unique du client (clé primaire).
+      nom: Nom de famille du client, ou raison sociale pour une entreprise.
+      prenom: Prénom du client (vide pour le segment Entreprise).
+      segment: "Segment commercial du client : Particulier, Professionnel ou Entreprise."
+      date_entree: Date d'entrée en relation avec la banque.
+      agence_id: Agence de rattachement du client (référence agences.agence_id).
+      ville: Ville de résidence du client.
+      revenu_mensuel: Revenu mensuel déclaré (chiffre d'affaires mensuel pour une entreprise), en MAD.
+
+  comptes:
+    description: Comptes bancaires détenus par les clients (une ligne par compte).
+    colonnes:
+      compte_id: Identifiant unique du compte (clé primaire).
+      client_id: Client titulaire du compte (référence clients.client_id).
+      type_compte: "Type de compte : Courant, Epargne ou Devises."
+      devise: "Devise de tenue du compte : MAD, EUR ou USD."
+      date_ouverture: Date d'ouverture du compte.
+      solde: Solde du compte à la date de référence, en MAD (contre-valeur pour les comptes en devises).
+      statut: "Statut du compte : Actif, Dormant ou Clôturé."
+
+  transactions:
+    description: >-
+      Opérations enregistrées sur les comptes, de janvier 2025 à octobre 2026
+      (une ligne par opération).
+    colonnes:
+      transaction_id: Identifiant unique de l'opération (clé primaire).
+      compte_id: Compte mouvementé (référence comptes.compte_id).
+      date_operation: Date de l'opération.
+      montant: Montant de l'opération en MAD, toujours positif (le sens est porté par la colonne sens).
+      sens: "Sens de l'opération : CREDIT (entrée d'argent sur le compte) ou DEBIT (sortie d'argent)."
+      canal: "Canal utilisé : Agence, GAB, Mobile, Web ou Virement."
+      categorie: >-
+        Nature de l'opération : Salaire, Virement reçu, Versement espèces,
+        Retrait espèces, Paiement facture, Achat, Virement émis,
+        Remboursement crédit ou Frais bancaires.
+
+  credits:
+    description: Crédits accordés aux clients (une ligne par crédit).
+    colonnes:
+      credit_id: Identifiant unique du crédit (clé primaire).
+      client_id: Client emprunteur (référence clients.client_id).
+      type_credit: "Type de crédit : Immobilier, Consommation, Auto ou Equipement."
+      montant_accorde: Montant initial accordé, en MAD.
+      taux_annuel: Taux d'intérêt annuel, en pourcentage (ex. 4.75 signifie 4,75 %).
+      duree_mois: Durée contractuelle du crédit, en mois.
+      date_octroi: Date d'octroi (déblocage) du crédit.
+      encours: Capital restant dû à la date de référence, en MAD.
+      statut: "Qualité du crédit : Sain, Impayé ou Contentieux."
+
+relations:
+  - clients.agence_id = agences.agence_id
+  - comptes.client_id = clients.client_id
+  - transactions.compte_id = comptes.compte_id
+  - credits.client_id = clients.client_id
+
+glossaire:
+  - terme: encours
+    definition: >-
+      Capital restant dû des crédits (colonne credits.encours).
+      L'encours total est SUM(credits.encours).
+  - terme: taux d'impayés
+    definition: >-
+      Encours des crédits au statut 'Impayé' ou 'Contentieux' divisé par
+      l'encours total, exprimé en pourcentage.
+  - terme: client actif
+    definition: Client qui détient au moins un compte au statut 'Actif'.
+  - terme: flux net
+    definition: >-
+      Somme des montants des transactions de sens 'CREDIT' moins la somme des
+      montants de sens 'DEBIT' :
+      SUM(CASE WHEN sens = 'CREDIT' THEN montant ELSE -montant END).
+  - terme: collecte
+    definition: >-
+      Dépôts de la clientèle : somme des soldes (comptes.solde) des comptes au
+      statut 'Actif'. La collecte d'épargne se limite aux comptes de type 'Epargne'.
+  - terme: région d'un client, d'un compte, d'un crédit ou d'une transaction
+    definition: >-
+      Région de l'agence de rattachement du client : remonter jusqu'à clients
+      puis joindre agences sur clients.agence_id pour lire agences.region.
+
+# Exemples question -> SQL envoyés au LLM (few-shot).
+# {schema} est remplacé par le préfixe du moteur (iceberg.banque ou banque) ;
+# le SQL doit donc rester valide à la fois en Trino et en SQLite.
+exemples:
+  - question: Quel est le taux d'impayés par type de crédit ?
+    sql: |
+      SELECT type_credit,
+             ROUND(100.0 * SUM(CASE WHEN statut IN ('Impayé', 'Contentieux') THEN encours ELSE 0 END)
+                   / NULLIF(SUM(encours), 0), 2) AS taux_impayes_pct
+      FROM {schema}.credits
+      GROUP BY type_credit
+      ORDER BY taux_impayes_pct DESC
+  - question: Quelles sont les 5 agences qui comptent le plus de clients actifs ?
+    sql: |
+      SELECT a.nom_agence,
+             a.ville,
+             COUNT(DISTINCT cl.client_id) AS nb_clients_actifs
+      FROM {schema}.clients cl
+      JOIN {schema}.agences a ON a.agence_id = cl.agence_id
+      JOIN {schema}.comptes co ON co.client_id = cl.client_id
+      WHERE co.statut = 'Actif'
+      GROUP BY a.nom_agence, a.ville
+      ORDER BY nb_clients_actifs DESC
+      LIMIT 5
+
+# Questions proposées en un clic dans la barre latérale de l'interface.
+questions_suggerees:
+  - Quel est le taux d'impayés par région ?
+  - Évolution mensuelle du flux net en 2026
+  - Top 10 des agences par encours de crédit
+  - Répartition des clients par segment
+  - Quelle est la collecte par type de compte ?
+  - Montant total des transactions par canal en 2026

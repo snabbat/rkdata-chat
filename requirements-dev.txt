@@ -1,0 +1,4 @@
+# Tests hors-ligne et génération des données (aucun besoin de Streamlit ni de Trino).
+pytest==9.2.0
+PyYAML==6.0.4
+requests==2.34.2

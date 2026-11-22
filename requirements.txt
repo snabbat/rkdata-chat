@@ -1,0 +1,5 @@
+streamlit==1.67.0
+pandas==3.1.1
+requests==2.34.2
+PyYAML==6.0.4
+trino==0.340.0
